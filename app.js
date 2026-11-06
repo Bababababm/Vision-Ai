@@ -20,7 +20,7 @@ const video = $('video');
 const canvas = $('overlay');
 const ctx = canvas?.getContext('2d');
 
-const VERSION = '0.10.22';
+const VERSION = '1.2.2';
 
 const MODEL_BASE =
   'https://storage.googleapis.com/mediapipe-models';
