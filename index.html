@@ -1,98 +1,364 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html lang="en">
+
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport"
-        content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+  >
+
   <meta name="theme-color" content="#101827">
-  <title>Vision AI</title>
-  <link rel="stylesheet" href="./style.css">
+
+  <meta
+    name="description"
+    content="Vision AI - On-device face and hand tracking"
+  >
+
+  <title>Vision AI — Smart Vision</title>
+
+  <link rel="stylesheet" href="./style.css?v=vision8">
+
+  <style>
+    [hidden] {
+      display: none !important;
+    }
+
+    #status {
+      overflow-wrap: anywhere;
+      font-size: 13px;
+      max-width: 65%;
+      text-align: right;
+    }
+
+    .viewer {
+      position: relative;
+      overflow: hidden;
+    }
+
+    #video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .hint {
+      font-size: 13px;
+      opacity: 0.8;
+      line-height: 1.6;
+    }
+
+    #libraryStatus {
+      overflow-wrap: anywhere;
+    }
+
+    #people li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    #people button {
+      padding: 8px 12px;
+    }
+
+    .check {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 15px 0;
+    }
+
+    .check input {
+      flex-shrink: 0;
+      margin-top: 4px;
+    }
+  </style>
+
 </head>
 
 <body>
+
 <main>
+
+  <!-- HEADER -->
+
   <header>
     <h1>◉ Vision AI</h1>
-    <span id="status">HTML loaded</span>
+
+    <span id="status" role="status" aria-live="polite">
+      Loading application...
+    </span>
   </header>
 
+
+  <!-- CAMERA VIEW -->
+
   <section class="viewer">
-    <video id="video" autoplay muted playsinline></video>
+
+    <video
+      id="video"
+      autoplay
+      muted
+      playsinline
+    ></video>
+
     <canvas id="overlay"></canvas>
+
     <p id="placeholder">
       Start camera to analyze faces and hands
     </p>
+
   </section>
+
+
+  <!-- CAMERA CONTROLS -->
 
   <div class="controls">
-    <button id="start" type="button">
+
+    <button
+      id="start"
+      type="button"
+    >
       Start camera
     </button>
-    <button id="stop" type="button" disabled>
+
+    <button
+      id="stop"
+      type="button"
+      disabled
+    >
       Stop
     </button>
-    <button id="switch" type="button" disabled>
+
+    <button
+      id="switch"
+      type="button"
+      disabled
+    >
       Switch camera
     </button>
+
   </div>
 
-  <section class="panel">
-    <h2>Live analysis</h2>
-    <p id="faceInfo">Face: —</p>
-    <p id="handInfo">Hands: —</p>
-    <p id="motionInfo">Movement: —</p>
-    <p id="matchInfo">Saved face: —</p>
-  </section>
+
+  <!-- LIVE ANALYSIS -->
 
   <section class="panel">
+
+    <h2>Live analysis</h2>
+
+    <p id="faceInfo">
+      Faces: —
+    </p>
+
+    <p id="handInfo">
+      Hands: —
+    </p>
+
+    <p id="motionInfo">
+      Movement: —
+    </p>
+
+    <p id="matchInfo">
+      Saved face: —
+    </p>
+
+    <p class="hint">
+      Face and hand movements are estimated using
+      AI landmarks. Results may be inaccurate
+      depending on lighting, camera position,
+      and movement.
+    </p>
+
+  </section>
+
+
+  <!-- PRIVATE FACE LIBRARY -->
+
+  <section class="panel">
+
     <h2>Private face library</h2>
 
     <p class="hint">
-      Experimental face-landmark matching is not
-      reliable identification. Only enroll people
-      with informed consent. Profiles are encrypted
-      locally using your passphrase.
+      Save consenting people's experimental
+      face geometry profiles.
+
+      Face geometry comparison does not provide
+      reliable identity verification.
+
+      Saved profiles are encrypted locally using
+      your passphrase.
     </p>
 
-    <label for="pass">Library passphrase</label>
-    <input id="pass"
-           type="password"
-           autocomplete="off"
-           placeholder="At least 10 characters">
 
-    <div class="controls">
-      <button id="unlock" type="button">
-        Create / unlock library
-      </button>
-      <button id="lock" type="button" disabled>
-        Lock
-      </button>
-    </div>
+    <!-- PASSPHRASE -->
 
-    <label for="person">Person's name</label>
-    <input id="person" placeholder="Name">
-
-    <label class="check">
-      <input type="checkbox" id="consent">
-      I confirm this person consented to saving
-      their face data.
+    <label for="pass">
+      Library passphrase
     </label>
 
-    <button id="save" type="button" disabled>
+    <input
+      id="pass"
+      type="password"
+      autocomplete="off"
+      placeholder="At least 10 characters"
+    >
+
+
+    <!-- LIBRARY CONTROLS -->
+
+    <div class="controls">
+
+      <button
+        id="unlock"
+        type="button"
+      >
+        Create / unlock library
+      </button>
+
+      <button
+        id="lock"
+        type="button"
+        disabled
+      >
+        Lock library
+      </button>
+
+    </div>
+
+
+    <!-- PERSON NAME -->
+
+    <label for="person">
+      Person's name
+    </label>
+
+    <input
+      id="person"
+      type="text"
+      maxlength="80"
+      autocomplete="off"
+      placeholder="Enter person's name"
+    >
+
+
+    <!-- CONSENT -->
+
+    <label class="check">
+
+      <input
+        type="checkbox"
+        id="consent"
+      >
+
+      <span>
+        I confirm that this person has given
+        informed consent to save their
+        face geometry profile on this device.
+      </span>
+
+    </label>
+
+
+    <!-- SAVE FACE -->
+
+    <button
+      id="save"
+      type="button"
+      disabled
+    >
       Save currently detected face
     </button>
 
-    <p id="libraryStatus" role="status"></p>
+
+    <!-- LIBRARY STATUS -->
+
+    <p
+      id="libraryStatus"
+      role="status"
+      aria-live="polite"
+    >
+      Library locked
+    </p>
+
+
+    <!-- SAVED PEOPLE -->
+
+    <h3>Saved profiles</h3>
+
     <ul id="people"></ul>
+
   </section>
 
+
+  <!-- PRIVACY INFORMATION -->
+
+  <section class="panel">
+
+    <h2>Privacy and processing</h2>
+
+    <p class="hint">
+      Camera frames are processed in your browser.
+      MediaPipe JavaScript, runtime files, and AI
+      models are downloaded from external servers.
+
+      The app does not intentionally upload camera
+      frames or saved face profiles.
+
+      Saved face geometry is encrypted with AES-GCM
+      and stored in browser IndexedDB.
+
+      Clearing browser site data may delete saved
+      profiles permanently.
+    </p>
+
+  </section>
+
+
+  <!-- FOOTER -->
+
   <footer>
-    Camera frames are processed locally.
-    AI model files load from external servers.
-    Encrypted face-landmark templates are stored
-    in IndexedDB.
+    Vision AI — Mobile Web App
+    <p>
+      Experimental face and gesture tracking.
+      Not suitable for identity verification.
+    </p>
   </footer>
+
 </main>
+
+
+<!-- SCRIPT ERROR DIAGNOSTICS -->
 
 <script>
   const statusElement =
@@ -102,6 +368,8 @@
     'HTML ready — loading JavaScript';
 
   window.addEventListener('error', event => {
+    console.error('Page error:', event.message);
+
     statusElement.textContent =
       'Script error: ' + event.message;
   });
@@ -109,18 +377,26 @@
   window.addEventListener(
     'unhandledrejection',
     event => {
+      const message =
+        event.reason?.message ||
+        String(event.reason);
+
+      console.error('Promise error:', message);
+
       statusElement.textContent =
-        'Script error: ' +
-        (event.reason?.message || event.reason);
+        'Script error: ' + message;
     }
   );
 </script>
 
+
+<!-- MAIN VISION AI APPLICATION -->
+
 <script
   type="module"
-  src="./app.js?v=vision5"
-  onerror="document.getElementById('status').textContent='Failed to load app.js'">
-</script>
+  src="./app.js?v=vision8"
+  onerror="document.getElementById('status').textContent='Failed to load app.js'"
+></script>
 
 </body>
 </html>
