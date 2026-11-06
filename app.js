@@ -1,24 +1,46 @@
 
 /*
-  VISION AI — COMPLETE APP.JS
-  Mobile web app for Android / Chrome
+ VISION AI — MOBILE WEB APP
+ Complete replacement for app.js
 
-  IMPORTANT:
-  Replace the entire old app.js with this code.
-  Do not append it to the existing code.
+ Features:
+ - Camera startup and switching
+ - Face landmark tracking
+ - Hand gesture estimates
+ - Head, eye and mouth movement
+ - Experimental saved-face comparison
+ - Encrypted local face library
+ - Alternative MediaPipe CDN loading
+ - Visible error diagnostics
 */
 
 const $ = id => document.getElementById(id);
 
 const video = $('video');
 const canvas = $('overlay');
-const ctx = canvas ? canvas.getContext('2d') : null;
+const ctx = canvas?.getContext('2d');
 
-const MP_VERSION = '0.10.22';
-const MP_URL =
-  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
-const MODEL_URL =
+const VERSION = '0.10.22';
+
+const MODEL_BASE =
   'https://storage.googleapis.com/mediapipe-models';
+
+const CDN_SOURCES = [
+  {
+    name: 'esm.sh',
+    module:
+      `https://esm.sh/@mediapipe/tasks-vision@${VERSION}`,
+    wasm:
+      `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VERSION}/wasm`
+  },
+  {
+    name: 'jsDelivr',
+    module:
+      `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VERSION}/+esm`,
+    wasm:
+      `https://unpkg.com/@mediapipe/tasks-vision@${VERSION}/wasm`
+  }
+];
 
 let FaceLandmarker;
 let HandLandmarker;
@@ -31,9 +53,10 @@ let stream = null;
 let running = false;
 let starting = false;
 let front = true;
-let animationId = null;
+let raf = null;
+let session = 0;
 let lastVideoTime = -1;
-let lastAnalysisError = '';
+let lastError = '';
 
 let lastFace = null;
 let lastFaceCount = 0;
@@ -46,18 +69,18 @@ let profiles = [];
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// =====================================
-// STATUS AND ERROR HANDLING
-// =====================================
+// ====================================
+// STATUS AND DIAGNOSTICS
+// ====================================
 
-function setText(id, text) {
+function setText(id, value) {
   const el = $(id);
-  if (el) el.textContent = text;
+  if (el) el.textContent = value;
 }
 
 function status(message) {
-  setText('status', message);
   console.log('[Vision AI]', message);
+  setText('status', message);
 }
 
 function libraryStatus(message) {
@@ -70,8 +93,10 @@ function errorMessage(error) {
 
 function showError(error) {
   const message = errorMessage(error);
-  console.error('[Vision AI ERROR]', error);
+
+  console.error('[Vision AI]', error);
   status('Error: ' + message);
+
   alert('Vision AI error:\n' + message);
 }
 
@@ -105,78 +130,223 @@ function updateButtons() {
   }
 }
 
-// =====================================
+// ====================================
+// MEDIAPIPE LOADER
+// ====================================
+
+async function loadMediaPipe() {
+  if (FilesetResolver) return;
+
+  let errors = [];
+
+  for (const source of CDN_SOURCES) {
+    try {
+      status('Loading AI from ' + source.name);
+
+      const mp = await import(
+        /* @vite-ignore */
+        source.module
+      );
+
+      const resolver = mp.FilesetResolver;
+      const face = mp.FaceLandmarker;
+      const hand = mp.HandLandmarker;
+
+      if (!resolver || !face || !hand) {
+        throw new Error(
+          'Required MediaPipe exports missing'
+        );
+      }
+
+      FilesetResolver = resolver;
+      FaceLandmarker = face;
+      HandLandmarker = hand;
+
+      status('AI library loaded');
+      return;
+
+    } catch (error) {
+      console.error(
+        source.name + ' failed:',
+        error
+      );
+
+      errors.push(
+        source.name + ': ' + errorMessage(error)
+      );
+    }
+  }
+
+  throw new Error(
+    'Unable to download MediaPipe library. ' +
+    errors.join(' | ')
+  );
+}
+
+async function initializeModels() {
+  if (faceTask && handTask) return;
+
+  await loadMediaPipe();
+
+  let vision = null;
+  let runtimeErrors = [];
+
+  for (const source of CDN_SOURCES) {
+    try {
+      status(
+        'Loading runtime from ' + source.name
+      );
+
+      vision =
+        await FilesetResolver.forVisionTasks(
+          source.wasm
+        );
+
+      break;
+
+    } catch (error) {
+      runtimeErrors.push(
+        source.name + ': ' + errorMessage(error)
+      );
+      console.error(error);
+    }
+  }
+
+  if (!vision) {
+    throw new Error(
+      'AI runtime failed: ' +
+      runtimeErrors.join(' | ')
+    );
+  }
+
+  if (!faceTask) {
+    status('Loading face model...');
+
+    faceTask =
+      await FaceLandmarker.createFromOptions(
+        vision,
+        {
+          baseOptions: {
+            modelAssetPath:
+              `${MODEL_BASE}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+            delegate: 'CPU'
+          },
+          runningMode: 'VIDEO',
+          numFaces: 2,
+          outputFaceBlendshapes: true
+        }
+      );
+  }
+
+  if (!handTask) {
+    status('Loading hand model...');
+
+    handTask =
+      await HandLandmarker.createFromOptions(
+        vision,
+        {
+          baseOptions: {
+            modelAssetPath:
+              `${MODEL_BASE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            delegate: 'CPU'
+          },
+          runningMode: 'VIDEO',
+          numHands: 2
+        }
+      );
+  }
+
+  status('AI models ready');
+}
+
+// ====================================
 // CAMERA
-// =====================================
+// ====================================
 
 async function startCamera() {
-  if (starting || running) return;
+  if (running || starting) return;
+
+  const currentSession = ++session;
 
   starting = true;
   updateButtons();
 
   try {
-    status('Start button pressed');
-
     if (!video || !canvas || !ctx) {
       throw new Error(
-        'Video or overlay is missing from index.html'
+        'Missing video or canvas in index.html'
       );
     }
 
     if (!window.isSecureContext) {
       throw new Error(
-        'Open Vision AI using its HTTPS GitHub Pages URL.'
+        'Camera requires HTTPS'
       );
     }
 
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(
-        'Camera API unavailable. Open the site directly in Chrome.'
+        'Camera API unavailable in this browser'
       );
     }
 
     status('Requesting camera permission...');
 
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: {
-          ideal: front ? 'user' : 'environment'
-        },
-        width: { ideal: 640 },
-        height: { ideal: 480 }
-      }
-    });
+    const newStream =
+      await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: {
+            ideal: front ? 'user' : 'environment'
+          },
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        }
+      });
+
+    if (currentSession !== session) {
+      newStream.getTracks().forEach(
+        track => track.stop()
+      );
+      return;
+    }
+
+    stream = newStream;
 
     video.srcObject = stream;
     video.muted = true;
     video.playsInline = true;
-    video.autoplay = true;
 
     await video.play();
 
-    if ($('placeholder')) {
-      $('placeholder').hidden = true;
-    }
+    if (currentSession !== session) return;
+
+    $('placeholder').hidden = true;
 
     running = true;
     starting = false;
     lastVideoTime = -1;
 
     updateButtons();
-    status('Camera active — loading AI models...');
+
+    status('Camera active — loading AI...');
 
     await initializeModels();
 
-    if (!running) return;
+    if (
+      !running ||
+      currentSession !== session
+    ) return;
 
     status('Analyzing locally');
-    analyzeFrame();
+    analyzeFrame(currentSession);
 
   } catch (error) {
+    if (currentSession !== session) return;
+
     running = false;
     starting = false;
+
     cleanupCamera();
     updateButtons();
     showError(error);
@@ -184,13 +354,15 @@ async function startCamera() {
 }
 
 function cleanupCamera() {
-  if (animationId !== null) {
-    cancelAnimationFrame(animationId);
-    animationId = null;
+  if (raf !== null) {
+    cancelAnimationFrame(raf);
+    raf = null;
   }
 
   if (stream) {
-    stream.getTracks().forEach(track => track.stop());
+    stream.getTracks().forEach(
+      track => track.stop()
+    );
   }
 
   stream = null;
@@ -202,7 +374,9 @@ function cleanupCamera() {
 
   if (ctx && canvas) {
     ctx.clearRect(
-      0, 0, canvas.width, canvas.height
+      0, 0,
+      canvas.width,
+      canvas.height
     );
   }
 
@@ -217,10 +391,13 @@ function cleanupCamera() {
 }
 
 function stopCamera() {
+  session++;
   running = false;
   starting = false;
+
   cleanupCamera();
   updateButtons();
+
   status('Stopped');
 }
 
@@ -228,6 +405,7 @@ async function switchCamera() {
   if (starting) return;
 
   const restart = running;
+
   stopCamera();
   front = !front;
 
@@ -242,81 +420,9 @@ async function switchCamera() {
   }
 }
 
-// =====================================
-// MEDIAPIPE MODELS
-// =====================================
-
-async function initializeModels() {
-  if (faceTask && handTask) return;
-
-  if (!FilesetResolver) {
-    status('Downloading MediaPipe library...');
-
-    const mp = await import(`${MP_URL}/+esm`);
-
-    FaceLandmarker = mp.FaceLandmarker;
-    HandLandmarker = mp.HandLandmarker;
-    FilesetResolver = mp.FilesetResolver;
-
-    if (
-      !FaceLandmarker ||
-      !HandLandmarker ||
-      !FilesetResolver
-    ) {
-      throw new Error(
-        'MediaPipe library exports are missing.'
-      );
-    }
-  }
-
-  status('Loading AI runtime...');
-
-  const vision =
-    await FilesetResolver.forVisionTasks(
-      `${MP_URL}/wasm`
-    );
-
-  if (!faceTask) {
-    status('Loading face model...');
-
-    faceTask = await FaceLandmarker.createFromOptions(
-      vision,
-      {
-        baseOptions: {
-          modelAssetPath:
-            `${MODEL_URL}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
-          delegate: 'CPU'
-        },
-        runningMode: 'VIDEO',
-        numFaces: 2,
-        outputFaceBlendshapes: true
-      }
-    );
-  }
-
-  if (!handTask) {
-    status('Loading hand model...');
-
-    handTask = await HandLandmarker.createFromOptions(
-      vision,
-      {
-        baseOptions: {
-          modelAssetPath:
-            `${MODEL_URL}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-          delegate: 'CPU'
-        },
-        runningMode: 'VIDEO',
-        numHands: 2
-      }
-    );
-  }
-
-  status('AI models ready');
-}
-
-// =====================================
+// ====================================
 // FACE GEOMETRY
-// =====================================
+// ====================================
 
 function distance(a, b) {
   return Math.hypot(
@@ -327,39 +433,37 @@ function distance(a, b) {
 
 function ratio(a, b, c, d) {
   return distance(a, b) /
-    Math.max(0.00001, distance(c, d));
+    Math.max(
+      0.00001,
+      distance(c, d)
+    );
 }
 
-// Experimental face geometry profile.
-// NOT reliable identity recognition.
-function createFaceTemplate(landmarks) {
+function createFaceTemplate(l) {
   const pairs = [
-    [33, 263],
-    [61, 291],
-    [1, 152],
-    [4, 168],
-    [133, 362],
-    [70, 300],
-    [234, 454],
-    [10, 152],
-    [13, 14],
-    [159, 145],
-    [386, 374],
-    [105, 334],
-    [58, 288],
-    [172, 397]
+    [33,263],
+    [61,291],
+    [1,152],
+    [4,168],
+    [133,362],
+    [70,300],
+    [234,454],
+    [10,152],
+    [13,14],
+    [159,145],
+    [386,374],
+    [105,334],
+    [58,288],
+    [172,397]
   ];
 
   const scale =
-    distance(landmarks[33], landmarks[263]) || 1;
+    distance(l[33], l[263]) || 1;
 
-  return pairs.map(([a, b]) =>
+  return pairs.map(([a,b]) =>
     Math.min(
       5,
-      distance(
-        landmarks[a],
-        landmarks[b]
-      ) / scale
+      distance(l[a], l[b]) / scale
     )
   );
 }
@@ -370,66 +474,68 @@ function compareTemplates(a, b) {
     !Array.isArray(b) ||
     !a.length ||
     a.length !== b.length
-  ) {
-    return Infinity;
-  }
+  ) return Infinity;
 
-  const sum = a.reduce(
-    (total, value, i) =>
-      total + (value - b[i]) ** 2,
-    0
+  return Math.sqrt(
+    a.reduce(
+      (sum, value, i) =>
+        sum + (value - b[i]) ** 2,
+      0
+    ) / a.length
   );
-
-  return Math.sqrt(sum / a.length);
 }
 
 function findClosestProfile(template) {
-  if (!encryptionKey || !profiles.length) {
-    return null;
-  }
+  if (
+    !encryptionKey ||
+    !profiles.length
+  ) return null;
 
-  let closest = null;
+  let best = null;
 
-  for (const profile of profiles) {
-    const score = compareTemplates(
-      template,
-      profile.template
-    );
+  for (const p of profiles) {
+    const score =
+      compareTemplates(
+        template,
+        p.template
+      );
 
     if (
       Number.isFinite(score) &&
-      (!closest || score < closest.score)
+      (!best || score < best.score)
     ) {
-      closest = {
-        name: profile.name,
+      best = {
+        name: p.name,
         score
       };
     }
   }
 
-  return closest;
+  return best;
 }
 
-// =====================================
+// ====================================
 // HAND GESTURES
-// =====================================
+// ====================================
 
-function detectGesture(landmarks) {
-  const wrist = landmarks[0];
+function detectGesture(l) {
+  const wrist = l[0];
 
-  const tips = [8, 12, 16, 20];
-  const joints = [6, 10, 14, 18];
+  const tips = [8,12,16,20];
+  const joints = [6,10,14,18];
 
-  const extended = tips.map((tip, i) =>
-    distance(landmarks[tip], wrist) >
-    distance(landmarks[joints[i]], wrist) * 1.13
+  const extended = tips.map(
+    (tip, i) =>
+      distance(l[tip], wrist) >
+      distance(l[joints[i]], wrist) * 1.13
   );
 
-  const count = extended.filter(Boolean).length;
+  const count =
+    extended.filter(Boolean).length;
 
   const pinch =
-    distance(landmarks[4], landmarks[8]) <
-    distance(landmarks[5], landmarks[17]) * 0.25;
+    distance(l[4], l[8]) <
+    distance(l[5], l[17]) * 0.25;
 
   if (pinch) return 'Pinch';
   if (count === 4) return 'Open palm';
@@ -450,21 +556,21 @@ function detectGesture(landmarks) {
   return `${count} fingers extended`;
 }
 
-// =====================================
-// HEAD, EYES AND MOUTH
-// =====================================
+// ====================================
+// FACIAL MOVEMENT
+// ====================================
 
-function analyzeFace(landmarks, blendshapes) {
-  const eyeWidth =
-    distance(landmarks[33], landmarks[263]) || 1;
+function analyzeFace(l, blendshapes) {
+  const width =
+    distance(l[33], l[263]) || 1;
 
   const offset =
     (
-      landmarks[1].x -
-      (landmarks[33].x + landmarks[263].x) / 2
-    ) / eyeWidth;
+      l[1].x -
+      (l[33].x + l[263].x) / 2
+    ) / width;
 
-  const headDirection =
+  const head =
     offset > 0.10
       ? 'Right'
       : offset < -0.10
@@ -472,58 +578,59 @@ function analyzeFace(landmarks, blendshapes) {
         : 'Center';
 
   const leftEye = ratio(
-    landmarks[159],
-    landmarks[145],
-    landmarks[33],
-    landmarks[133]
+    l[159], l[145],
+    l[33], l[133]
   );
 
   const rightEye = ratio(
-    landmarks[386],
-    landmarks[374],
-    landmarks[362],
-    landmarks[263]
+    l[386], l[374],
+    l[362], l[263]
   );
 
-  const mouthRatio = ratio(
-    landmarks[13],
-    landmarks[14],
-    landmarks[61],
-    landmarks[291]
+  const mouth = ratio(
+    l[13], l[14],
+    l[61], l[291]
   );
 
   const scores = Object.fromEntries(
-    (blendshapes || []).map(item => [
-      item.categoryName,
-      item.score
-    ])
+    (blendshapes || []).map(
+      item => [
+        item.categoryName,
+        item.score
+      ]
+    )
   );
 
-  const blinking =
+  const blink =
     (
       (scores.eyeBlinkLeft ?? 0) > 0.55 &&
       (scores.eyeBlinkRight ?? 0) > 0.55
     ) ||
-    (leftEye < 0.12 && rightEye < 0.12);
+    (
+      leftEye < 0.12 &&
+      rightEye < 0.12
+    );
 
-  const mouthOpen = mouthRatio > 0.10;
+  const mouthOpen = mouth > 0.10;
 
   const centerY =
-    (landmarks[1].y + landmarks[152].y) / 2;
+    (l[1].y + l[152].y) / 2;
 
+  let motion = '';
   const now = performance.now();
-  let movement = '';
 
   if (
     previousHead &&
     now - previousHead.time < 1000
   ) {
-    const change = centerY - previousHead.y;
+    const change =
+      centerY - previousHead.y;
 
     if (Math.abs(change) > 0.025) {
-      movement = change > 0
-        ? ' · Moving down'
-        : ' · Moving up';
+      motion =
+        change > 0
+          ? ' · Moving down'
+          : ' · Moving up';
     }
   }
 
@@ -533,28 +640,28 @@ function analyzeFace(landmarks, blendshapes) {
   };
 
   return (
-    `Head: ${headDirection} · ` +
-    `Eyes: ${blinking ? 'Blink/closed' : 'Open'} · ` +
+    `Head: ${head} · ` +
+    `Eyes: ${blink ? 'Blink/closed' : 'Open'} · ` +
     `Mouth: ${mouthOpen ? 'Open' : 'Closed'}` +
-    movement
+    motion
   );
 }
 
-// =====================================
-// DRAW LANDMARKS
-// =====================================
+// ====================================
+// DRAWING
+// ====================================
 
-function drawLandmarks(landmarks, color) {
+function drawLandmarks(points, color) {
   if (!ctx) return;
 
   ctx.fillStyle = color;
 
-  for (const point of landmarks) {
+  for (const p of points) {
     const x =
-      (front ? 1 - point.x : point.x) *
+      (front ? 1 - p.x : p.x) *
       canvas.width;
 
-    const y = point.y * canvas.height;
+    const y = p.y * canvas.height;
 
     ctx.beginPath();
     ctx.arc(x, y, 1.5, 0, Math.PI * 2);
@@ -562,12 +669,15 @@ function drawLandmarks(landmarks, color) {
   }
 }
 
-// =====================================
-// LIVE ANALYSIS
-// =====================================
+// ====================================
+// REAL-TIME ANALYSIS
+// ====================================
 
-function analyzeFrame() {
-  if (!running) return;
+function analyzeFrame(currentSession) {
+  if (
+    !running ||
+    currentSession !== session
+  ) return;
 
   try {
     if (
@@ -584,13 +694,21 @@ function analyzeFrame() {
       const now = performance.now();
 
       const faceResults =
-        faceTask.detectForVideo(video, now);
+        faceTask.detectForVideo(
+          video,
+          now
+        );
 
       const handResults =
-        handTask.detectForVideo(video, now);
+        handTask.detectForVideo(
+          video,
+          now
+        );
 
       ctx.clearRect(
-        0, 0, canvas.width, canvas.height
+        0, 0,
+        canvas.width,
+        canvas.height
       );
 
       const faces =
@@ -601,16 +719,23 @@ function analyzeFrame() {
 
       lastFaceCount = faces.length;
 
-      lastFace = faces.length === 1
-        ? createFaceTemplate(faces[0])
-        : null;
+      lastFace =
+        faces.length === 1
+          ? createFaceTemplate(faces[0])
+          : null;
 
-      faces.forEach(face =>
-        drawLandmarks(face, '#5df4bd')
+      faces.forEach(
+        face => drawLandmarks(
+          face,
+          '#5df4bd'
+        )
       );
 
-      hands.forEach(hand =>
-        drawLandmarks(hand, '#ffc970')
+      hands.forEach(
+        hand => drawLandmarks(
+          hand,
+          '#ffc970'
+        )
       );
 
       setText(
@@ -623,46 +748,51 @@ function analyzeFrame() {
         `Hands: ${hands.length}` +
         (
           hands.length
-            ? ' · ' + hands.map(detectGesture).join(' / ')
+            ? ' · ' +
+              hands.map(
+                detectGesture
+              ).join(' / ')
             : ''
         )
       );
 
       if (faces.length === 1) {
-        const blendshapes =
-          faceResults.faceBlendshapes?.[0]?.categories;
+        const blend =
+          faceResults.faceBlendshapes?.[0]
+            ?.categories;
 
         setText(
           'motionInfo',
-          analyzeFace(faces[0], blendshapes)
+          analyzeFace(
+            faces[0],
+            blend
+          )
         );
 
         const match =
           findClosestProfile(lastFace);
 
-        if (match) {
-          setText(
-            'matchInfo',
-            `Closest saved profile: ${match.name} ` +
-            `(distance ${match.score.toFixed(3)}; ` +
-            'identity unverified)'
-          );
-        } else {
-          setText(
-            'matchInfo',
-            encryptionKey
+        setText(
+          'matchInfo',
+          match
+            ? `Closest saved geometry: ${match.name} ` +
+              `(distance ${match.score.toFixed(3)}; ` +
+              'identity unverified)'
+            : encryptionKey
               ? 'No saved profiles'
               : 'Face library locked'
-          );
-        }
+        );
 
       } else {
-        setText('motionInfo', 'Movement: —');
+        setText(
+          'motionInfo',
+          'Movement: —'
+        );
 
         setText(
           'matchInfo',
           faces.length > 1
-            ? 'Multiple faces — matching paused'
+            ? 'Matching paused: multiple faces'
             : 'Saved face: —'
         );
 
@@ -675,73 +805,95 @@ function analyzeFrame() {
   } catch (error) {
     const message = errorMessage(error);
 
-    if (message !== lastAnalysisError) {
-      lastAnalysisError = message;
+    if (message !== lastError) {
+      lastError = message;
       console.error(error);
-      status('Analysis error: ' + message);
+
+      status(
+        'Analysis error: ' + message
+      );
     }
   }
 
-  animationId = requestAnimationFrame(analyzeFrame);
+  raf = requestAnimationFrame(
+    () => analyzeFrame(currentSession)
+  );
 }
 
-// =====================================
+// ====================================
 // INDEXEDDB
-// =====================================
+// ====================================
 
 function openDatabase() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(
-      'vision-ai-private-v1',
-      1
-    );
+  return new Promise(
+    (resolve, reject) => {
+      const request = indexedDB.open(
+        'vision-ai-private-v1',
+        1
+      );
 
-    request.onupgradeneeded = () => {
-      const database = request.result;
+      request.onupgradeneeded = () => {
+        const database = request.result;
 
-      if (!database.objectStoreNames.contains('data')) {
-        database.createObjectStore('data');
-      }
-    };
+        if (
+          !database.objectStoreNames
+            .contains('data')
+        ) {
+          database.createObjectStore(
+            'data'
+          );
+        }
+      };
 
-    request.onsuccess = () =>
-      resolve(request.result);
+      request.onsuccess = () =>
+        resolve(request.result);
 
-    request.onerror = () =>
-      reject(request.error);
-  });
+      request.onerror = () =>
+        reject(request.error);
+    }
+  );
 }
 
 function dbGet(name) {
-  return new Promise((resolve, reject) => {
-    const request = db
-      .transaction('data')
-      .objectStore('data')
-      .get(name);
+  return new Promise(
+    (resolve, reject) => {
+      const request = db
+        .transaction('data')
+        .objectStore('data')
+        .get(name);
 
-    request.onsuccess = () =>
-      resolve(request.result);
+      request.onsuccess = () =>
+        resolve(request.result);
 
-    request.onerror = () =>
-      reject(request.error);
-  });
+      request.onerror = () =>
+        reject(request.error);
+    }
+  );
 }
 
 function dbPut(name, value) {
-  return new Promise((resolve, reject) => {
-    const request = db
-      .transaction('data', 'readwrite')
-      .objectStore('data')
-      .put(value, name);
+  return new Promise(
+    (resolve, reject) => {
+      const request = db
+        .transaction(
+          'data',
+          'readwrite'
+        )
+        .objectStore('data')
+        .put(value, name);
 
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
+      request.onsuccess = () =>
+        resolve();
+
+      request.onerror = () =>
+        reject(request.error);
+    }
+  );
 }
 
-// =====================================
+// ====================================
 // ENCRYPTION
-// =====================================
+// ====================================
 
 function toBase64(value) {
   return btoa(
@@ -754,7 +906,7 @@ function toBase64(value) {
 function fromBase64(value) {
   return Uint8Array.from(
     atob(value),
-    char => char.charCodeAt(0)
+    c => c.charCodeAt(0)
   );
 }
 
@@ -792,9 +944,14 @@ async function encryptProfiles(data) {
 
   const encrypted =
     await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
+      {
+        name: 'AES-GCM',
+        iv
+      },
       encryptionKey,
-      encoder.encode(JSON.stringify(data))
+      encoder.encode(
+        JSON.stringify(data)
+      )
     );
 
   return {
@@ -805,7 +962,9 @@ async function encryptProfiles(data) {
 
 async function saveLibrary() {
   if (!db || !encryptionKey) {
-    throw new Error('Face library is locked.');
+    throw new Error(
+      'Face library is locked'
+    );
   }
 
   await dbPut(
@@ -816,9 +975,9 @@ async function saveLibrary() {
   renderProfiles();
 }
 
-// =====================================
-// FACE LIBRARY
-// =====================================
+// ====================================
+// SAVED PROFILES
+// ====================================
 
 function renderProfiles() {
   const list = $('people');
@@ -827,15 +986,24 @@ function renderProfiles() {
   list.replaceChildren();
 
   for (const profile of profiles) {
-    const item = document.createElement('li');
-    const name = document.createElement('span');
-    const button = document.createElement('button');
+    const item =
+      document.createElement('li');
+
+    const name =
+      document.createElement('span');
+
+    const button =
+      document.createElement('button');
 
     name.textContent = profile.name;
     button.textContent = 'Delete';
 
     button.onclick = async () => {
-      if (!confirm(`Delete ${profile.name}?`)) return;
+      if (
+        !confirm(
+          `Delete ${profile.name}?`
+        )
+      ) return;
 
       const previous = profiles;
 
@@ -845,13 +1013,18 @@ function renderProfiles() {
         );
 
         await saveLibrary();
-        libraryStatus('Profile deleted');
+
+        libraryStatus(
+          'Profile deleted'
+        );
 
       } catch (error) {
         profiles = previous;
         renderProfiles();
+
         libraryStatus(
-          'Delete failed: ' + errorMessage(error)
+          'Delete failed: ' +
+          errorMessage(error)
         );
       }
     };
@@ -861,29 +1034,43 @@ function renderProfiles() {
   }
 }
 
+// ====================================
+// UNLOCK LIBRARY
+// ====================================
+
 async function unlockLibrary() {
   try {
-    const passphrase = $('pass')?.value || '';
+    const passphrase =
+      $('pass')?.value || '';
 
     if (passphrase.length < 10) {
       throw new Error(
-        'Passphrase must contain at least 10 characters.'
+        'Passphrase must have at least 10 characters'
       );
     }
 
     db ??= await openDatabase();
 
-    const storedSalt = await dbGet('salt');
+    const storedSalt =
+      await dbGet('salt');
+
     const existing = !!storedSalt;
 
     const salt = existing
       ? fromBase64(storedSalt)
-      : crypto.getRandomValues(new Uint8Array(16));
+      : crypto.getRandomValues(
+          new Uint8Array(16)
+        );
 
     const candidateKey =
-      await deriveKey(passphrase, salt);
+      await deriveKey(
+        passphrase,
+        salt
+      );
 
-    const vault = await dbGet('vault');
+    const vault =
+      await dbGet('vault');
+
     let loadedProfiles = [];
 
     if (vault) {
@@ -897,17 +1084,22 @@ async function unlockLibrary() {
           fromBase64(vault.cipher)
         );
 
-      loadedProfiles = JSON.parse(
-        decoder.decode(decrypted)
-      );
+      loadedProfiles =
+        JSON.parse(
+          decoder.decode(decrypted)
+        );
 
-      if (!Array.isArray(loadedProfiles)) {
-        throw new Error('Invalid library data.');
+      if (
+        !Array.isArray(loadedProfiles)
+      ) {
+        throw new Error(
+          'Invalid library data'
+        );
       }
 
     } else if (existing) {
       throw new Error(
-        'Encrypted library data is missing.'
+        'Encrypted library data missing'
       );
     }
 
@@ -916,7 +1108,11 @@ async function unlockLibrary() {
 
     if (!existing) {
       await saveLibrary();
-      await dbPut('salt', toBase64(salt));
+
+      await dbPut(
+        'salt',
+        toBase64(salt)
+      );
     }
 
     $('pass').value = '';
@@ -925,20 +1121,26 @@ async function unlockLibrary() {
     updateButtons();
 
     libraryStatus(
-      `Unlocked · ${profiles.length} saved profiles`
+      `Unlocked · ${profiles.length} profiles`
     );
 
   } catch (error) {
     encryptionKey = null;
     profiles = [];
+
     renderProfiles();
     updateButtons();
 
     libraryStatus(
-      'Unlock failed: ' + errorMessage(error)
+      'Unlock failed: ' +
+      errorMessage(error)
     );
   }
 }
+
+// ====================================
+// LOCK LIBRARY
+// ====================================
 
 function lockLibrary() {
   encryptionKey = null;
@@ -946,8 +1148,13 @@ function lockLibrary() {
 
   renderProfiles();
   updateButtons();
+
   libraryStatus('Library locked');
 }
+
+// ====================================
+// SAVE FACE
+// ====================================
 
 async function saveFace() {
   try {
@@ -957,21 +1164,25 @@ async function saveFace() {
       lastFaceCount !== 1
     ) {
       throw new Error(
-        'Unlock the library and show exactly one face.'
+        'Unlock library and show exactly one face'
       );
     }
 
     if (!$('consent')?.checked) {
       throw new Error(
-        'Confirm that the person consented to enrollment.'
+        'Consent confirmation required'
       );
     }
 
-    const name = $('person')?.value.trim() || '';
+    const name =
+      $('person')?.value.trim() || '';
 
-    if (!name || name.length > 80) {
+    if (
+      !name ||
+      name.length > 80
+    ) {
       throw new Error(
-        'Enter a name between 1 and 80 characters.'
+        'Enter a name of 1–80 characters'
       );
     }
 
@@ -979,7 +1190,8 @@ async function saveFace() {
       id: crypto.randomUUID(),
       name,
       template: [...lastFace],
-      createdAt: new Date().toISOString()
+      createdAt:
+        new Date().toISOString()
     };
 
     profiles.push(profile);
@@ -990,6 +1202,7 @@ async function saveFace() {
       profiles = profiles.filter(
         p => p.id !== profile.id
       );
+
       throw error;
     }
 
@@ -997,34 +1210,31 @@ async function saveFace() {
     $('consent').checked = false;
 
     libraryStatus(
-      `${name} saved in encrypted local library`
+      `${name} saved locally (experimental geometry)`
     );
 
   } catch (error) {
-    libraryStatus(errorMessage(error));
+    libraryStatus(
+      errorMessage(error)
+    );
   }
 }
 
-// =====================================
-// BUTTON INITIALIZATION
-// =====================================
+// ====================================
+// INITIALIZE BUTTONS
+// ====================================
 
 function initializeApp() {
-  console.log('Vision AI initializing...');
+  const start = $('start');
 
-  const startButton = $('start');
-
-  if (!startButton) {
-    console.error('Start button missing from HTML');
-    status('Error: Start button missing');
+  if (!start) {
+    status(
+      'Error: Start button missing'
+    );
     return;
   }
 
-  // Connect camera button first.
-  startButton.onclick = () => {
-    status('Start button pressed');
-    startCamera();
-  };
+  start.onclick = startCamera;
 
   if ($('stop')) {
     $('stop').onclick = stopCamera;
@@ -1048,38 +1258,62 @@ function initializeApp() {
 
   updateButtons();
 
-  status('Vision AI ready — tap Start camera');
-  libraryStatus('Library locked');
+  status(
+    'Vision AI ready — tap Start camera'
+  );
 
-  console.log('Vision AI initialized successfully');
+  libraryStatus(
+    'Library locked'
+  );
 }
 
-// =====================================
-// GLOBAL ERROR REPORTING
-// =====================================
+// ====================================
+// GLOBAL ERROR HANDLING
+// ====================================
 
-window.addEventListener('error', event => {
-  console.error('JavaScript error:', event.message);
-  status('JavaScript error: ' + event.message);
-});
+window.addEventListener(
+  'error',
+  event => {
+    console.error(event.error);
 
-window.addEventListener('unhandledrejection', event => {
-  const message = errorMessage(event.reason);
-  console.error('Unhandled error:', message);
-  status('Error: ' + message);
-});
+    status(
+      'JavaScript error: ' +
+      event.message
+    );
+  }
+);
 
-window.addEventListener('pagehide', () => {
-  running = false;
-  starting = false;
-  cleanupCamera();
-  encryptionKey = null;
-  profiles = [];
-});
+window.addEventListener(
+  'unhandledrejection',
+  event => {
+    const message =
+      errorMessage(event.reason);
 
-// =====================================
-// START APP
-// =====================================
+    console.error(event.reason);
+
+    status(
+      'Error: ' + message
+    );
+  }
+);
+
+window.addEventListener(
+  'pagehide',
+  () => {
+    session++;
+    running = false;
+    starting = false;
+
+    cleanupCamera();
+
+    encryptionKey = null;
+    profiles = [];
+  }
+);
+
+// ====================================
+// START APPLICATION
+// ====================================
 
 if (document.readyState === 'loading') {
   document.addEventListener(
