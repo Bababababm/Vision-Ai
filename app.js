@@ -1,22 +1,24 @@
 
 /*
- Vision AI — Mobile Web App
- Replace the entire app.js with this file.
+  VISION AI — COMPLETE APP.JS
+  Mobile web app for Android / Chrome
 
- Features:
- - Camera startup with visible errors
- - Face landmarks
- - Hand gesture estimates
- - Head, eye and mouth movement estimates
- - Experimental saved-face geometry comparison
- - AES-GCM encrypted IndexedDB profiles
+  IMPORTANT:
+  Replace the entire old app.js with this code.
+  Do not append it to the existing code.
 */
 
 const $ = id => document.getElementById(id);
 
 const video = $('video');
 const canvas = $('overlay');
-const ctx = canvas?.getContext('2d');
+const ctx = canvas ? canvas.getContext('2d') : null;
+
+const MP_VERSION = '0.10.22';
+const MP_URL =
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+const MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models';
 
 let FaceLandmarker;
 let HandLandmarker;
@@ -29,54 +31,53 @@ let stream = null;
 let running = false;
 let starting = false;
 let front = true;
-let raf = null;
+let animationId = null;
 let lastVideoTime = -1;
-let lastError = '';
+let lastAnalysisError = '';
 
 let lastFace = null;
 let lastFaceCount = 0;
 let previousHead = null;
 
 let db = null;
-let key = null;
+let encryptionKey = null;
 let profiles = [];
 
-const MP_VERSION = '0.10.22';
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
-const MP_CDN =
-  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+// =====================================
+// STATUS AND ERROR HANDLING
+// =====================================
 
-const MODEL_BASE =
-  'https://storage.googleapis.com/mediapipe-models';
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-
-function setText(id, value) {
+function setText(id, text) {
   const el = $(id);
-  if (el) el.textContent = value;
+  if (el) el.textContent = text;
 }
 
 function status(message) {
   setText('status', message);
+  console.log('[Vision AI]', message);
 }
 
 function libraryStatus(message) {
   setText('libraryStatus', message);
 }
 
+function errorMessage(error) {
+  return error?.message || String(error);
+}
+
 function showError(error) {
-  const message = error?.message || String(error);
-
-  console.error('Vision AI:', error);
+  const message = errorMessage(error);
+  console.error('[Vision AI ERROR]', error);
   status('Error: ' + message);
-
   alert('Vision AI error:\n' + message);
 }
 
 function updateButtons() {
   if ($('start')) {
-    $('start').disabled = running || starting;
+    $('start').disabled = starting || running;
   }
 
   if ($('stop')) {
@@ -88,144 +89,70 @@ function updateButtons() {
   }
 
   if ($('unlock')) {
-    $('unlock').disabled = !!key;
+    $('unlock').disabled = !!encryptionKey;
   }
 
   if ($('lock')) {
-    $('lock').disabled = !key;
+    $('lock').disabled = !encryptionKey;
   }
 
   if ($('save')) {
     $('save').disabled =
       !running ||
-      !key ||
+      !encryptionKey ||
       !lastFace ||
       lastFaceCount !== 1;
   }
 }
 
-// -----------------------------
-// AI model initialization
-// -----------------------------
+// =====================================
+// CAMERA
+// =====================================
 
-async function initModels() {
-  if (faceTask && handTask) return;
-
-  status('Downloading AI library...');
-
-  if (!FilesetResolver) {
-    const mp = await import(`${MP_CDN}/+esm`);
-
-    FaceLandmarker = mp.FaceLandmarker;
-    HandLandmarker = mp.HandLandmarker;
-    FilesetResolver = mp.FilesetResolver;
-
-    if (
-      !FaceLandmarker ||
-      !HandLandmarker ||
-      !FilesetResolver
-    ) {
-      throw new Error(
-        'MediaPipe library did not load correctly.'
-      );
-    }
-  }
-
-  status('Loading AI runtime...');
-
-  const files =
-    await FilesetResolver.forVisionTasks(
-      `${MP_CDN}/wasm`
-    );
-
-  status('Loading face model...');
-
-  if (!faceTask) {
-    faceTask =
-      await FaceLandmarker.createFromOptions(
-        files,
-        {
-          baseOptions: {
-            modelAssetPath:
-              `${MODEL_BASE}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
-            delegate: 'CPU'
-          },
-          runningMode: 'VIDEO',
-          numFaces: 2,
-          outputFaceBlendshapes: true
-        }
-      );
-  }
-
-  status('Loading hand model...');
-
-  if (!handTask) {
-    handTask =
-      await HandLandmarker.createFromOptions(
-        files,
-        {
-          baseOptions: {
-            modelAssetPath:
-              `${MODEL_BASE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-            delegate: 'CPU'
-          },
-          runningMode: 'VIDEO',
-          numHands: 2
-        }
-      );
-  }
-
-  status('AI models ready');
-}
-
-// -----------------------------
-// Camera
-// -----------------------------
-
-async function start() {
-  if (running || starting) return;
+async function startCamera() {
+  if (starting || running) return;
 
   starting = true;
   updateButtons();
 
   try {
+    status('Start button pressed');
+
     if (!video || !canvas || !ctx) {
       throw new Error(
-        'Missing video or overlay element in index.html.'
+        'Video or overlay is missing from index.html'
       );
     }
 
     if (!window.isSecureContext) {
       throw new Error(
-        'Camera requires HTTPS. Open the GitHub Pages website.'
+        'Open Vision AI using its HTTPS GitHub Pages URL.'
       );
     }
 
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(
-        'Camera API unavailable. Try opening this site in Chrome.'
+        'Camera API unavailable. Open the site directly in Chrome.'
       );
     }
 
-    // Request camera before downloading models.
-    // This makes permission failures visible immediately.
     status('Requesting camera permission...');
 
-    stream =
-      await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: {
-            ideal: front ? 'user' : 'environment'
-          },
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        }
-      });
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: {
+          ideal: front ? 'user' : 'environment'
+        },
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      }
+    });
 
     video.srcObject = stream;
     video.muted = true;
     video.playsInline = true;
+    video.autoplay = true;
 
     await video.play();
 
@@ -237,34 +164,33 @@ async function start() {
     starting = false;
     lastVideoTime = -1;
 
-    status('Camera active. Loading AI...');
     updateButtons();
+    status('Camera active — loading AI models...');
 
-    // Start displaying the camera before AI loads.
-    await initModels();
+    await initializeModels();
 
     if (!running) return;
 
     status('Analyzing locally');
-    loop();
+    analyzeFrame();
 
   } catch (error) {
-    cleanupCamera();
-    starting = false;
     running = false;
+    starting = false;
+    cleanupCamera();
     updateButtons();
     showError(error);
   }
 }
 
 function cleanupCamera() {
-  cancelAnimationFrame(raf);
-  raf = null;
+  if (animationId !== null) {
+    cancelAnimationFrame(animationId);
+    animationId = null;
+  }
 
   if (stream) {
-    stream.getTracks().forEach(track => {
-      track.stop();
-    });
+    stream.getTracks().forEach(track => track.stop());
   }
 
   stream = null;
@@ -276,10 +202,7 @@ function cleanupCamera() {
 
   if (ctx && canvas) {
     ctx.clearRect(
-      0,
-      0,
-      canvas.width,
-      canvas.height
+      0, 0, canvas.width, canvas.height
     );
   }
 
@@ -293,26 +216,23 @@ function cleanupCamera() {
   lastVideoTime = -1;
 }
 
-function stop() {
+function stopCamera() {
   running = false;
   starting = false;
-
   cleanupCamera();
   updateButtons();
-
   status('Stopped');
 }
 
 async function switchCamera() {
   if (starting) return;
 
-  const wasRunning = running;
-
-  stop();
+  const restart = running;
+  stopCamera();
   front = !front;
 
-  if (wasRunning) {
-    await start();
+  if (restart) {
+    await startCamera();
   } else {
     status(
       front
@@ -322,11 +242,83 @@ async function switchCamera() {
   }
 }
 
-// -----------------------------
-// Geometry utilities
-// -----------------------------
+// =====================================
+// MEDIAPIPE MODELS
+// =====================================
 
-function dist(a, b) {
+async function initializeModels() {
+  if (faceTask && handTask) return;
+
+  if (!FilesetResolver) {
+    status('Downloading MediaPipe library...');
+
+    const mp = await import(`${MP_URL}/+esm`);
+
+    FaceLandmarker = mp.FaceLandmarker;
+    HandLandmarker = mp.HandLandmarker;
+    FilesetResolver = mp.FilesetResolver;
+
+    if (
+      !FaceLandmarker ||
+      !HandLandmarker ||
+      !FilesetResolver
+    ) {
+      throw new Error(
+        'MediaPipe library exports are missing.'
+      );
+    }
+  }
+
+  status('Loading AI runtime...');
+
+  const vision =
+    await FilesetResolver.forVisionTasks(
+      `${MP_URL}/wasm`
+    );
+
+  if (!faceTask) {
+    status('Loading face model...');
+
+    faceTask = await FaceLandmarker.createFromOptions(
+      vision,
+      {
+        baseOptions: {
+          modelAssetPath:
+            `${MODEL_URL}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: 'CPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 2,
+        outputFaceBlendshapes: true
+      }
+    );
+  }
+
+  if (!handTask) {
+    status('Loading hand model...');
+
+    handTask = await HandLandmarker.createFromOptions(
+      vision,
+      {
+        baseOptions: {
+          modelAssetPath:
+            `${MODEL_URL}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+          delegate: 'CPU'
+        },
+        runningMode: 'VIDEO',
+        numHands: 2
+      }
+    );
+  }
+
+  status('AI models ready');
+}
+
+// =====================================
+// FACE GEOMETRY
+// =====================================
+
+function distance(a, b) {
   return Math.hypot(
     a.x - b.x,
     a.y - b.y
@@ -334,13 +326,13 @@ function dist(a, b) {
 }
 
 function ratio(a, b, c, d) {
-  return dist(a, b) /
-    Math.max(0.00001, dist(c, d));
+  return distance(a, b) /
+    Math.max(0.00001, distance(c, d));
 }
 
-// Experimental landmark geometry.
-// This is NOT a reliable face identity model.
-function template(l) {
+// Experimental face geometry profile.
+// NOT reliable identity recognition.
+function createFaceTemplate(landmarks) {
   const pairs = [
     [33, 263],
     [61, 291],
@@ -359,92 +351,89 @@ function template(l) {
   ];
 
   const scale =
-    dist(l[33], l[263]) || 1;
+    distance(landmarks[33], landmarks[263]) || 1;
 
   return pairs.map(([a, b]) =>
     Math.min(
       5,
-      dist(l[a], l[b]) / scale
+      distance(
+        landmarks[a],
+        landmarks[b]
+      ) / scale
     )
   );
 }
 
-function profileDistance(a, b) {
+function compareTemplates(a, b) {
   if (
     !Array.isArray(a) ||
     !Array.isArray(b) ||
-    a.length !== b.length ||
-    !a.length
+    !a.length ||
+    a.length !== b.length
   ) {
     return Infinity;
   }
 
-  return Math.sqrt(
-    a.reduce(
-      (sum, value, i) =>
-        sum + (value - b[i]) ** 2,
-      0
-    ) / a.length
+  const sum = a.reduce(
+    (total, value, i) =>
+      total + (value - b[i]) ** 2,
+    0
   );
+
+  return Math.sqrt(sum / a.length);
 }
 
-function closestProfile(t) {
-  if (!key || !profiles.length) {
+function findClosestProfile(template) {
+  if (!encryptionKey || !profiles.length) {
     return null;
   }
 
-  let best = null;
+  let closest = null;
 
-  for (const p of profiles) {
-    const distance =
-      profileDistance(t, p.template);
+  for (const profile of profiles) {
+    const score = compareTemplates(
+      template,
+      profile.template
+    );
 
     if (
-      Number.isFinite(distance) &&
-      (!best || distance < best.distance)
+      Number.isFinite(score) &&
+      (!closest || score < closest.score)
     ) {
-      best = {
-        name: p.name,
-        distance
+      closest = {
+        name: profile.name,
+        score
       };
     }
   }
 
-  return best;
+  return closest;
 }
 
-// -----------------------------
-// Hand gesture estimates
-// -----------------------------
+// =====================================
+// HAND GESTURES
+// =====================================
 
-function gesture(l) {
-  const wrist = l[0];
+function detectGesture(landmarks) {
+  const wrist = landmarks[0];
 
   const tips = [8, 12, 16, 20];
-  const pips = [6, 10, 14, 18];
+  const joints = [6, 10, 14, 18];
 
-  const extended = tips.map(
-    (id, i) =>
-      dist(l[id], wrist) >
-      dist(l[pips[i]], wrist) * 1.13
+  const extended = tips.map((tip, i) =>
+    distance(landmarks[tip], wrist) >
+    distance(landmarks[joints[i]], wrist) * 1.13
   );
 
-  const count =
-    extended.filter(Boolean).length;
+  const count = extended.filter(Boolean).length;
 
   const pinch =
-    dist(l[4], l[8]) <
-    dist(l[5], l[17]) * 0.25;
+    distance(landmarks[4], landmarks[8]) <
+    distance(landmarks[5], landmarks[17]) * 0.25;
 
   if (pinch) return 'Pinch';
-
-  if (count === 4) {
-    return 'Open palm';
-  }
-
-  if (count === 0) {
-    return 'Fist';
-  }
+  if (count === 4) return 'Open palm';
+  if (count === 0) return 'Fist';
 
   if (extended[0] && count === 1) {
     return 'Pointing';
@@ -461,86 +450,80 @@ function gesture(l) {
   return `${count} fingers extended`;
 }
 
-// -----------------------------
-// Face movement analysis
-// -----------------------------
+// =====================================
+// HEAD, EYES AND MOUTH
+// =====================================
 
-function faceAnalysis(l, blend) {
-  const width =
-    dist(l[33], l[263]) || 1;
+function analyzeFace(landmarks, blendshapes) {
+  const eyeWidth =
+    distance(landmarks[33], landmarks[263]) || 1;
 
   const offset =
     (
-      l[1].x -
-      (l[33].x + l[263].x) / 2
-    ) / width;
+      landmarks[1].x -
+      (landmarks[33].x + landmarks[263].x) / 2
+    ) / eyeWidth;
 
-  const yaw =
+  const headDirection =
     offset > 0.10
-      ? 'turned right'
+      ? 'Right'
       : offset < -0.10
-        ? 'turned left'
-        : 'centered';
+        ? 'Left'
+        : 'Center';
 
-  const eyeL = ratio(
-    l[159],
-    l[145],
-    l[33],
-    l[133]
+  const leftEye = ratio(
+    landmarks[159],
+    landmarks[145],
+    landmarks[33],
+    landmarks[133]
   );
 
-  const eyeR = ratio(
-    l[386],
-    l[374],
-    l[362],
-    l[263]
+  const rightEye = ratio(
+    landmarks[386],
+    landmarks[374],
+    landmarks[362],
+    landmarks[263]
   );
 
-  const mouth = ratio(
-    l[13],
-    l[14],
-    l[61],
-    l[291]
+  const mouthRatio = ratio(
+    landmarks[13],
+    landmarks[14],
+    landmarks[61],
+    landmarks[291]
   );
 
   const scores = Object.fromEntries(
-    (blend || []).map(item => [
+    (blendshapes || []).map(item => [
       item.categoryName,
       item.score
     ])
   );
 
-  const blink =
+  const blinking =
     (
       (scores.eyeBlinkLeft ?? 0) > 0.55 &&
       (scores.eyeBlinkRight ?? 0) > 0.55
     ) ||
-    (
-      eyeL < 0.12 &&
-      eyeR < 0.12
-    );
+    (leftEye < 0.12 && rightEye < 0.12);
 
-  const mouthOpen = mouth > 0.10;
+  const mouthOpen = mouthRatio > 0.10;
 
   const centerY =
-    (l[1].y + l[152].y) / 2;
-
-  let motion = '—';
+    (landmarks[1].y + landmarks[152].y) / 2;
 
   const now = performance.now();
+  let movement = '';
 
   if (
     previousHead &&
     now - previousHead.time < 1000
   ) {
-    const change =
-      centerY - previousHead.y;
+    const change = centerY - previousHead.y;
 
     if (Math.abs(change) > 0.025) {
-      motion =
-        change > 0
-          ? 'Head moving down'
-          : 'Head moving up';
+      movement = change > 0
+        ? ' · Moving down'
+        : ' · Moving up';
     }
   }
 
@@ -549,43 +532,41 @@ function faceAnalysis(l, blend) {
     time: now
   };
 
-  return {
-    text:
-      `Head: ${yaw} · ` +
-      `Eyes: ${blink ? 'blink/closed' : 'open'} · ` +
-      `Mouth: ${mouthOpen ? 'open' : 'closed'}`,
-    motion
-  };
+  return (
+    `Head: ${headDirection} · ` +
+    `Eyes: ${blinking ? 'Blink/closed' : 'Open'} · ` +
+    `Mouth: ${mouthOpen ? 'Open' : 'Closed'}` +
+    movement
+  );
 }
 
-// -----------------------------
-// Drawing
-// -----------------------------
+// =====================================
+// DRAW LANDMARKS
+// =====================================
 
 function drawLandmarks(landmarks, color) {
-  if (!ctx || !canvas) return;
+  if (!ctx) return;
 
   ctx.fillStyle = color;
 
-  for (const p of landmarks) {
+  for (const point of landmarks) {
     const x =
-      (front ? 1 - p.x : p.x) *
+      (front ? 1 - point.x : point.x) *
       canvas.width;
 
-    const y =
-      p.y * canvas.height;
+    const y = point.y * canvas.height;
 
     ctx.beginPath();
-    ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+    ctx.arc(x, y, 1.5, 0, Math.PI * 2);
     ctx.fill();
   }
 }
 
-// -----------------------------
-// Real-time processing
-// -----------------------------
+// =====================================
+// LIVE ANALYSIS
+// =====================================
 
-function loop() {
+function analyzeFrame() {
   if (!running) return;
 
   try {
@@ -602,102 +583,86 @@ function loop() {
 
       const now = performance.now();
 
-      const faces =
+      const faceResults =
         faceTask.detectForVideo(video, now);
 
-      const hands =
+      const handResults =
         handTask.detectForVideo(video, now);
 
       ctx.clearRect(
-        0,
-        0,
-        canvas.width,
-        canvas.height
+        0, 0, canvas.width, canvas.height
       );
 
-      const fl =
-        faces.faceLandmarks || [];
+      const faces =
+        faceResults.faceLandmarks || [];
 
-      const hl =
-        hands.landmarks || [];
+      const hands =
+        handResults.landmarks || [];
 
-      lastFaceCount = fl.length;
+      lastFaceCount = faces.length;
 
-      lastFace =
-        fl.length === 1
-          ? template(fl[0])
-          : null;
+      lastFace = faces.length === 1
+        ? createFaceTemplate(faces[0])
+        : null;
 
-      fl.forEach(l =>
-        drawLandmarks(l, '#5df4bd')
+      faces.forEach(face =>
+        drawLandmarks(face, '#5df4bd')
       );
 
-      hl.forEach(l =>
-        drawLandmarks(l, '#ffc970')
+      hands.forEach(hand =>
+        drawLandmarks(hand, '#ffc970')
       );
 
       setText(
         'faceInfo',
-        `Faces: ${fl.length}`
+        `Faces: ${faces.length}`
       );
 
       setText(
         'handInfo',
-        `Hands: ${hl.length}` +
+        `Hands: ${hands.length}` +
         (
-          hl.length
-            ? ' · ' +
-              hl.map(gesture).join(' / ')
+          hands.length
+            ? ' · ' + hands.map(detectGesture).join(' / ')
             : ''
         )
       );
 
-      if (fl.length === 1) {
-        const info = faceAnalysis(
-          fl[0],
-          faces.faceBlendshapes?.[0]
-            ?.categories
-        );
+      if (faces.length === 1) {
+        const blendshapes =
+          faceResults.faceBlendshapes?.[0]?.categories;
 
         setText(
           'motionInfo',
-          info.text +
-          (
-            info.motion !== '—'
-              ? ' · ' + info.motion
-              : ''
-          )
+          analyzeFace(faces[0], blendshapes)
         );
 
-        const m =
-          closestProfile(lastFace);
+        const match =
+          findClosestProfile(lastFace);
 
-        if (m) {
+        if (match) {
           setText(
             'matchInfo',
-            `Closest saved geometry: ${m.name} ` +
-            `(distance ${m.distance.toFixed(3)}; ` +
-            'identity not verified)'
+            `Closest saved profile: ${match.name} ` +
+            `(distance ${match.score.toFixed(3)}; ` +
+            'identity unverified)'
           );
         } else {
           setText(
             'matchInfo',
-            key
+            encryptionKey
               ? 'No saved profiles'
               : 'Face library locked'
           );
         }
 
       } else {
-        setText(
-          'motionInfo',
-          'Movement: —'
-        );
+        setText('motionInfo', 'Movement: —');
 
         setText(
           'matchInfo',
-          fl.length > 1
-            ? 'Matching paused: multiple faces'
+          faces.length > 1
+            ? 'Multiple faces — matching paused'
             : 'Saved face: —'
         );
 
@@ -707,101 +672,78 @@ function loop() {
       updateButtons();
     }
 
-    if (lastError) {
-      lastError = '';
-    }
-
   } catch (error) {
-    const message =
-      error?.message || String(error);
+    const message = errorMessage(error);
 
-    if (message !== lastError) {
-      lastError = message;
+    if (message !== lastAnalysisError) {
+      lastAnalysisError = message;
       console.error(error);
-
-      status(
-        'Analysis error: ' + message
-      );
+      status('Analysis error: ' + message);
     }
   }
 
-  raf = requestAnimationFrame(loop);
+  animationId = requestAnimationFrame(analyzeFrame);
 }
 
-// -----------------------------
-// IndexedDB storage
-// -----------------------------
+// =====================================
+// INDEXEDDB
+// =====================================
 
-function openDb() {
-  return new Promise(
-    (resolve, reject) => {
-      const request = indexedDB.open(
-        'vision-ai-private-v1',
-        1
-      );
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(
+      'vision-ai-private-v1',
+      1
+    );
 
-      request.onupgradeneeded = () => {
-        const database = request.result;
+    request.onupgradeneeded = () => {
+      const database = request.result;
 
-        if (
-          !database.objectStoreNames
-            .contains('data')
-        ) {
-          database.createObjectStore('data');
-        }
-      };
+      if (!database.objectStoreNames.contains('data')) {
+        database.createObjectStore('data');
+      }
+    };
 
-      request.onsuccess = () =>
-        resolve(request.result);
+    request.onsuccess = () =>
+      resolve(request.result);
 
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
+    request.onerror = () =>
+      reject(request.error);
+  });
 }
 
-function get(name) {
-  return new Promise(
-    (resolve, reject) => {
-      const request = db
-        .transaction('data')
-        .objectStore('data')
-        .get(name);
+function dbGet(name) {
+  return new Promise((resolve, reject) => {
+    const request = db
+      .transaction('data')
+      .objectStore('data')
+      .get(name);
 
-      request.onsuccess = () =>
-        resolve(request.result);
+    request.onsuccess = () =>
+      resolve(request.result);
 
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
+    request.onerror = () =>
+      reject(request.error);
+  });
 }
 
-function put(name, value) {
-  return new Promise(
-    (resolve, reject) => {
-      const request = db
-        .transaction(
-          'data',
-          'readwrite'
-        )
-        .objectStore('data')
-        .put(value, name);
+function dbPut(name, value) {
+  return new Promise((resolve, reject) => {
+    const request = db
+      .transaction('data', 'readwrite')
+      .objectStore('data')
+      .put(value, name);
 
-      request.onsuccess = () =>
-        resolve();
-
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
 }
 
-// -----------------------------
-// Encryption
-// -----------------------------
+// =====================================
+// ENCRYPTION
+// =====================================
 
-function b64(value) {
+function toBase64(value) {
   return btoa(
     String.fromCharCode(
       ...new Uint8Array(value)
@@ -809,18 +751,18 @@ function b64(value) {
   );
 }
 
-function bytes(value) {
+function fromBase64(value) {
   return Uint8Array.from(
     atob(value),
-    c => c.charCodeAt(0)
+    char => char.charCodeAt(0)
   );
 }
 
-async function derive(pass, salt) {
+async function deriveKey(passphrase, salt) {
   const material =
     await crypto.subtle.importKey(
       'raw',
-      enc.encode(pass),
+      encoder.encode(passphrase),
       'PBKDF2',
       false,
       ['deriveKey']
@@ -843,228 +785,174 @@ async function derive(pass, salt) {
   );
 }
 
-async function encryptData(data) {
-  const iv =
-    crypto.getRandomValues(
-      new Uint8Array(12)
-    );
+async function encryptProfiles(data) {
+  const iv = crypto.getRandomValues(
+    new Uint8Array(12)
+  );
 
-  const cipher =
+  const encrypted =
     await crypto.subtle.encrypt(
-      {
-        name: 'AES-GCM',
-        iv
-      },
-      key,
-      enc.encode(JSON.stringify(data))
+      { name: 'AES-GCM', iv },
+      encryptionKey,
+      encoder.encode(JSON.stringify(data))
     );
 
   return {
-    iv: b64(iv),
-    cipher: b64(cipher)
+    iv: toBase64(iv),
+    cipher: toBase64(encrypted)
   };
 }
 
-async function persist() {
-  if (!key || !db) {
-    throw new Error(
-      'Face library is locked.'
-    );
+async function saveLibrary() {
+  if (!db || !encryptionKey) {
+    throw new Error('Face library is locked.');
   }
 
-  await put(
+  await dbPut(
     'vault',
-    await encryptData(profiles)
+    await encryptProfiles(profiles)
   );
 
-  renderPeople();
+  renderProfiles();
 }
 
-// -----------------------------
-// Saved profile display
-// -----------------------------
+// =====================================
+// FACE LIBRARY
+// =====================================
 
-function renderPeople() {
-  const ul = $('people');
-  if (!ul) return;
+function renderProfiles() {
+  const list = $('people');
+  if (!list) return;
 
-  ul.replaceChildren();
+  list.replaceChildren();
 
-  for (const p of profiles) {
-    const li =
-      document.createElement('li');
+  for (const profile of profiles) {
+    const item = document.createElement('li');
+    const name = document.createElement('span');
+    const button = document.createElement('button');
 
-    const name =
-      document.createElement('span');
+    name.textContent = profile.name;
+    button.textContent = 'Delete';
 
-    const del =
-      document.createElement('button');
-
-    name.textContent = p.name;
-    del.textContent = 'Delete';
-
-    del.onclick = async () => {
-      if (
-        !confirm(
-          `Delete ${p.name}'s saved profile?`
-        )
-      ) {
-        return;
-      }
+    button.onclick = async () => {
+      if (!confirm(`Delete ${profile.name}?`)) return;
 
       const previous = profiles;
 
       try {
         profiles = profiles.filter(
-          x => x.id !== p.id
+          p => p.id !== profile.id
         );
 
-        await persist();
-
-        libraryStatus(
-          'Profile deleted'
-        );
+        await saveLibrary();
+        libraryStatus('Profile deleted');
 
       } catch (error) {
         profiles = previous;
-        renderPeople();
-
+        renderProfiles();
         libraryStatus(
-          'Delete failed: ' + error.message
+          'Delete failed: ' + errorMessage(error)
         );
       }
     };
 
-    li.append(name, del);
-    ul.append(li);
+    item.append(name, button);
+    list.append(item);
   }
 }
 
-// -----------------------------
-// Unlock encrypted library
-// -----------------------------
-
-async function unlock() {
+async function unlockLibrary() {
   try {
-    const pass = $('pass')?.value || '';
+    const passphrase = $('pass')?.value || '';
 
-    if (pass.length < 10) {
+    if (passphrase.length < 10) {
       throw new Error(
-        'Use a passphrase of at least 10 characters.'
+        'Passphrase must contain at least 10 characters.'
       );
     }
 
-    db ??= await openDb();
+    db ??= await openDatabase();
 
-    const storedSalt =
-      await get('salt');
-
+    const storedSalt = await dbGet('salt');
     const existing = !!storedSalt;
 
-    const proposedSalt = existing
-      ? bytes(storedSalt)
-      : crypto.getRandomValues(
-          new Uint8Array(16)
-        );
+    const salt = existing
+      ? fromBase64(storedSalt)
+      : crypto.getRandomValues(new Uint8Array(16));
 
-    const proposedKey =
-      await derive(
-        pass,
-        proposedSalt
-      );
+    const candidateKey =
+      await deriveKey(passphrase, salt);
 
-    const vault =
-      await get('vault');
-
-    let data = [];
+    const vault = await dbGet('vault');
+    let loadedProfiles = [];
 
     if (vault) {
-      const plaintext =
+      const decrypted =
         await crypto.subtle.decrypt(
           {
             name: 'AES-GCM',
-            iv: bytes(vault.iv)
+            iv: fromBase64(vault.iv)
           },
-          proposedKey,
-          bytes(vault.cipher)
+          candidateKey,
+          fromBase64(vault.cipher)
         );
 
-      data = JSON.parse(
-        dec.decode(plaintext)
+      loadedProfiles = JSON.parse(
+        decoder.decode(decrypted)
       );
 
-      if (!Array.isArray(data)) {
-        throw new Error(
-          'Invalid library format.'
-        );
+      if (!Array.isArray(loadedProfiles)) {
+        throw new Error('Invalid library data.');
       }
 
     } else if (existing) {
       throw new Error(
-        'Library data is missing.'
+        'Encrypted library data is missing.'
       );
     }
 
-    key = proposedKey;
-    profiles = data;
+    encryptionKey = candidateKey;
+    profiles = loadedProfiles;
 
     if (!existing) {
-      // Save encrypted empty vault first,
-      // then store its salt.
-      await persist();
-      await put(
-        'salt',
-        b64(proposedSalt)
-      );
+      await saveLibrary();
+      await dbPut('salt', toBase64(salt));
     }
 
     $('pass').value = '';
 
-    renderPeople();
+    renderProfiles();
     updateButtons();
 
     libraryStatus(
-      `Library unlocked · ` +
-      `${profiles.length} saved profiles`
+      `Unlocked · ${profiles.length} saved profiles`
     );
 
   } catch (error) {
-    key = null;
+    encryptionKey = null;
     profiles = [];
-
-    renderPeople();
+    renderProfiles();
     updateButtons();
 
     libraryStatus(
-      'Could not unlock: ' +
-      error.message
+      'Unlock failed: ' + errorMessage(error)
     );
   }
 }
 
-// -----------------------------
-// Lock library
-// -----------------------------
-
-function lock() {
-  key = null;
+function lockLibrary() {
+  encryptionKey = null;
   profiles = [];
 
-  renderPeople();
+  renderProfiles();
   updateButtons();
-
   libraryStatus('Library locked');
 }
-
-// -----------------------------
-// Save a consenting person's
-// experimental geometry profile
-// -----------------------------
 
 async function saveFace() {
   try {
     if (
-      !key ||
+      !encryptionKey ||
       !lastFace ||
       lastFaceCount !== 1
     ) {
@@ -1075,19 +963,15 @@ async function saveFace() {
 
     if (!$('consent')?.checked) {
       throw new Error(
-        'Consent confirmation required.'
+        'Confirm that the person consented to enrollment.'
       );
     }
 
-    const name =
-      $('person')?.value.trim() || '';
+    const name = $('person')?.value.trim() || '';
 
-    if (
-      !name ||
-      name.length > 80
-    ) {
+    if (!name || name.length > 80) {
       throw new Error(
-        'Enter a name of 1–80 characters.'
+        'Enter a name between 1 and 80 characters.'
       );
     }
 
@@ -1095,19 +979,17 @@ async function saveFace() {
       id: crypto.randomUUID(),
       name,
       template: [...lastFace],
-      createdAt:
-        new Date().toISOString()
+      createdAt: new Date().toISOString()
     };
 
     profiles.push(profile);
 
     try {
-      await persist();
+      await saveLibrary();
     } catch (error) {
       profiles = profiles.filter(
         p => p.id !== profile.id
       );
-
       throw error;
     }
 
@@ -1115,1312 +997,95 @@ async function saveFace() {
     $('consent').checked = false;
 
     libraryStatus(
-      `${name} saved locally ` +
-      '(experimental face geometry)'
+      `${name} saved in encrypted local library`
     );
 
   } catch (error) {
-    libraryStatus(error.message);
+    libraryStatus(errorMessage(error));
   }
 }
 
-// -----------------------------
-// Connect buttons immediately
-// -----------------------------
+// =====================================
+// BUTTON INITIALIZATION
+// =====================================
 
 function initializeApp() {
-  const required = [
-    'video',
-    'overlay',
-    'start',
-    'stop',
-    'switch',
-    'unlock',
-    'lock',
-    'save',
-    'pass',
-    'person',
-    'consent',
-    'people'
-  ];
+  console.log('Vision AI initializing...');
 
-  const missing =
-    required.filter(id => !$(id));
+  const startButton = $('start');
 
-  if (missing.length) {
-    const message =
-      'Missing HTML elements: ' +
-      missing.join(', ');
-
-    console.error(message);
-    status(message);
+  if (!startButton) {
+    console.error('Start button missing from HTML');
+    status('Error: Start button missing');
     return;
   }
 
-  $('start').addEventListener(
-    'click',
-    start
-  );
-
-  $('stop').addEventListener(
-    'click',
-    stop
-  );
-
-  $('switch').addEventListener(
-    'click',
-    switchCamera
-  );
-
-  $('unlock').addEventListener(
-    'click',
-    unlock
-  );
-
-  $('lock').addEventListener(
-    'click',
-    lock
-  );
-
-  $('save').addEventListener(
-    'click',
-    saveFace
-  );
-
-  updateButtons();
-
-  status('Idle — ready to start');
-  libraryStatus('Library locked');
-}
-
-window.addEventListener(
-  'pagehide',
-  () => {
-    running = false;
-    cleanupCamera();
-
-    key = null;
-    profiles = [];
-  }
-);
-
-if (document.readyState === 'loading') {
-  document.addEventListener(
-    'DOMContentLoaded',
-    initializeApp
-  );
-} else {
-  initializeApp();
-}
-/*
- Vision AI — Mobile Web App
- Replace the entire app.js with this file.
-
- Features:
- - Camera startup with visible errors
- - Face landmarks
- - Hand gesture estimates
- - Head, eye and mouth movement estimates
- - Experimental saved-face geometry comparison
- - AES-GCM encrypted IndexedDB profiles
-*/
-
-const $ = id => document.getElementById(id);
-
-const video = $('video');
-const canvas = $('overlay');
-const ctx = canvas?.getContext('2d');
-
-let FaceLandmarker;
-let HandLandmarker;
-let FilesetResolver;
-
-let faceTask = null;
-let handTask = null;
-let stream = null;
-
-let running = false;
-let starting = false;
-let front = true;
-let raf = null;
-let lastVideoTime = -1;
-let lastError = '';
-
-let lastFace = null;
-let lastFaceCount = 0;
-let previousHead = null;
-
-let db = null;
-let key = null;
-let profiles = [];
-
-const MP_VERSION = '0.10.22';
-
-const MP_CDN =
-  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
-
-const MODEL_BASE =
-  'https://storage.googleapis.com/mediapipe-models';
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-
-function setText(id, value) {
-  const el = $(id);
-  if (el) el.textContent = value;
-}
-
-function status(message) {
-  setText('status', message);
-}
-
-function libraryStatus(message) {
-  setText('libraryStatus', message);
-}
-
-function showError(error) {
-  const message = error?.message || String(error);
-
-  console.error('Vision AI:', error);
-  status('Error: ' + message);
-
-  alert('Vision AI error:\n' + message);
-}
-
-function updateButtons() {
-  if ($('start')) {
-    $('start').disabled = running || starting;
-  }
+  // Connect camera button first.
+  startButton.onclick = () => {
+    status('Start button pressed');
+    startCamera();
+  };
 
   if ($('stop')) {
-    $('stop').disabled = !running && !starting;
+    $('stop').onclick = stopCamera;
   }
 
   if ($('switch')) {
-    $('switch').disabled = starting;
+    $('switch').onclick = switchCamera;
   }
 
   if ($('unlock')) {
-    $('unlock').disabled = !!key;
+    $('unlock').onclick = unlockLibrary;
   }
 
   if ($('lock')) {
-    $('lock').disabled = !key;
+    $('lock').onclick = lockLibrary;
   }
 
   if ($('save')) {
-    $('save').disabled =
-      !running ||
-      !key ||
-      !lastFace ||
-      lastFaceCount !== 1;
-  }
-}
-
-// -----------------------------
-// AI model initialization
-// -----------------------------
-
-async function initModels() {
-  if (faceTask && handTask) return;
-
-  status('Downloading AI library...');
-
-  if (!FilesetResolver) {
-    const mp = await import(`${MP_CDN}/+esm`);
-
-    FaceLandmarker = mp.FaceLandmarker;
-    HandLandmarker = mp.HandLandmarker;
-    FilesetResolver = mp.FilesetResolver;
-
-    if (
-      !FaceLandmarker ||
-      !HandLandmarker ||
-      !FilesetResolver
-    ) {
-      throw new Error(
-        'MediaPipe library did not load correctly.'
-      );
-    }
+    $('save').onclick = saveFace;
   }
 
-  status('Loading AI runtime...');
-
-  const files =
-    await FilesetResolver.forVisionTasks(
-      `${MP_CDN}/wasm`
-    );
-
-  status('Loading face model...');
-
-  if (!faceTask) {
-    faceTask =
-      await FaceLandmarker.createFromOptions(
-        files,
-        {
-          baseOptions: {
-            modelAssetPath:
-              `${MODEL_BASE}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
-            delegate: 'CPU'
-          },
-          runningMode: 'VIDEO',
-          numFaces: 2,
-          outputFaceBlendshapes: true
-        }
-      );
-  }
-
-  status('Loading hand model...');
-
-  if (!handTask) {
-    handTask =
-      await HandLandmarker.createFromOptions(
-        files,
-        {
-          baseOptions: {
-            modelAssetPath:
-              `${MODEL_BASE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-            delegate: 'CPU'
-          },
-          runningMode: 'VIDEO',
-          numHands: 2
-        }
-      );
-  }
-
-  status('AI models ready');
-}
-
-// -----------------------------
-// Camera
-// -----------------------------
-
-async function start() {
-  if (running || starting) return;
-
-  starting = true;
   updateButtons();
 
-  try {
-    if (!video || !canvas || !ctx) {
-      throw new Error(
-        'Missing video or overlay element in index.html.'
-      );
-    }
+  status('Vision AI ready — tap Start camera');
+  libraryStatus('Library locked');
 
-    if (!window.isSecureContext) {
-      throw new Error(
-        'Camera requires HTTPS. Open the GitHub Pages website.'
-      );
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error(
-        'Camera API unavailable. Try opening this site in Chrome.'
-      );
-    }
-
-    // Request camera before downloading models.
-    // This makes permission failures visible immediately.
-    status('Requesting camera permission...');
-
-    stream =
-      await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: {
-            ideal: front ? 'user' : 'environment'
-          },
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        }
-      });
-
-    video.srcObject = stream;
-    video.muted = true;
-    video.playsInline = true;
-
-    await video.play();
-
-    if ($('placeholder')) {
-      $('placeholder').hidden = true;
-    }
-
-    running = true;
-    starting = false;
-    lastVideoTime = -1;
-
-    status('Camera active. Loading AI...');
-    updateButtons();
-
-    // Start displaying the camera before AI loads.
-    await initModels();
-
-    if (!running) return;
-
-    status('Analyzing locally');
-    loop();
-
-  } catch (error) {
-    cleanupCamera();
-    starting = false;
-    running = false;
-    updateButtons();
-    showError(error);
-  }
+  console.log('Vision AI initialized successfully');
 }
 
-function cleanupCamera() {
-  cancelAnimationFrame(raf);
-  raf = null;
+// =====================================
+// GLOBAL ERROR REPORTING
+// =====================================
 
-  if (stream) {
-    stream.getTracks().forEach(track => {
-      track.stop();
-    });
-  }
+window.addEventListener('error', event => {
+  console.error('JavaScript error:', event.message);
+  status('JavaScript error: ' + event.message);
+});
 
-  stream = null;
+window.addEventListener('unhandledrejection', event => {
+  const message = errorMessage(event.reason);
+  console.error('Unhandled error:', message);
+  status('Error: ' + message);
+});
 
-  if (video) {
-    video.pause();
-    video.srcObject = null;
-  }
-
-  if (ctx && canvas) {
-    ctx.clearRect(
-      0,
-      0,
-      canvas.width,
-      canvas.height
-    );
-  }
-
-  if ($('placeholder')) {
-    $('placeholder').hidden = false;
-  }
-
-  lastFace = null;
-  lastFaceCount = 0;
-  previousHead = null;
-  lastVideoTime = -1;
-}
-
-function stop() {
+window.addEventListener('pagehide', () => {
   running = false;
   starting = false;
-
   cleanupCamera();
-  updateButtons();
-
-  status('Stopped');
-}
-
-async function switchCamera() {
-  if (starting) return;
-
-  const wasRunning = running;
-
-  stop();
-  front = !front;
-
-  if (wasRunning) {
-    await start();
-  } else {
-    status(
-      front
-        ? 'Front camera selected'
-        : 'Rear camera selected'
-    );
-  }
-}
-
-// -----------------------------
-// Geometry utilities
-// -----------------------------
-
-function dist(a, b) {
-  return Math.hypot(
-    a.x - b.x,
-    a.y - b.y
-  );
-}
-
-function ratio(a, b, c, d) {
-  return dist(a, b) /
-    Math.max(0.00001, dist(c, d));
-}
-
-// Experimental landmark geometry.
-// This is NOT a reliable face identity model.
-function template(l) {
-  const pairs = [
-    [33, 263],
-    [61, 291],
-    [1, 152],
-    [4, 168],
-    [133, 362],
-    [70, 300],
-    [234, 454],
-    [10, 152],
-    [13, 14],
-    [159, 145],
-    [386, 374],
-    [105, 334],
-    [58, 288],
-    [172, 397]
-  ];
-
-  const scale =
-    dist(l[33], l[263]) || 1;
-
-  return pairs.map(([a, b]) =>
-    Math.min(
-      5,
-      dist(l[a], l[b]) / scale
-    )
-  );
-}
-
-function profileDistance(a, b) {
-  if (
-    !Array.isArray(a) ||
-    !Array.isArray(b) ||
-    a.length !== b.length ||
-    !a.length
-  ) {
-    return Infinity;
-  }
-
-  return Math.sqrt(
-    a.reduce(
-      (sum, value, i) =>
-        sum + (value - b[i]) ** 2,
-      0
-    ) / a.length
-  );
-}
-
-function closestProfile(t) {
-  if (!key || !profiles.length) {
-    return null;
-  }
-
-  let best = null;
-
-  for (const p of profiles) {
-    const distance =
-      profileDistance(t, p.template);
-
-    if (
-      Number.isFinite(distance) &&
-      (!best || distance < best.distance)
-    ) {
-      best = {
-        name: p.name,
-        distance
-      };
-    }
-  }
-
-  return best;
-}
-
-// -----------------------------
-// Hand gesture estimates
-// -----------------------------
-
-function gesture(l) {
-  const wrist = l[0];
-
-  const tips = [8, 12, 16, 20];
-  const pips = [6, 10, 14, 18];
-
-  const extended = tips.map(
-    (id, i) =>
-      dist(l[id], wrist) >
-      dist(l[pips[i]], wrist) * 1.13
-  );
-
-  const count =
-    extended.filter(Boolean).length;
-
-  const pinch =
-    dist(l[4], l[8]) <
-    dist(l[5], l[17]) * 0.25;
-
-  if (pinch) return 'Pinch';
-
-  if (count === 4) {
-    return 'Open palm';
-  }
-
-  if (count === 0) {
-    return 'Fist';
-  }
-
-  if (extended[0] && count === 1) {
-    return 'Pointing';
-  }
-
-  if (
-    extended[0] &&
-    extended[1] &&
-    count === 2
-  ) {
-    return 'Peace sign';
-  }
-
-  return `${count} fingers extended`;
-}
-
-// -----------------------------
-// Face movement analysis
-// -----------------------------
-
-function faceAnalysis(l, blend) {
-  const width =
-    dist(l[33], l[263]) || 1;
-
-  const offset =
-    (
-      l[1].x -
-      (l[33].x + l[263].x) / 2
-    ) / width;
-
-  const yaw =
-    offset > 0.10
-      ? 'turned right'
-      : offset < -0.10
-        ? 'turned left'
-        : 'centered';
-
-  const eyeL = ratio(
-    l[159],
-    l[145],
-    l[33],
-    l[133]
-  );
-
-  const eyeR = ratio(
-    l[386],
-    l[374],
-    l[362],
-    l[263]
-  );
-
-  const mouth = ratio(
-    l[13],
-    l[14],
-    l[61],
-    l[291]
-  );
-
-  const scores = Object.fromEntries(
-    (blend || []).map(item => [
-      item.categoryName,
-      item.score
-    ])
-  );
-
-  const blink =
-    (
-      (scores.eyeBlinkLeft ?? 0) > 0.55 &&
-      (scores.eyeBlinkRight ?? 0) > 0.55
-    ) ||
-    (
-      eyeL < 0.12 &&
-      eyeR < 0.12
-    );
-
-  const mouthOpen = mouth > 0.10;
-
-  const centerY =
-    (l[1].y + l[152].y) / 2;
-
-  let motion = '—';
-
-  const now = performance.now();
-
-  if (
-    previousHead &&
-    now - previousHead.time < 1000
-  ) {
-    const change =
-      centerY - previousHead.y;
-
-    if (Math.abs(change) > 0.025) {
-      motion =
-        change > 0
-          ? 'Head moving down'
-          : 'Head moving up';
-    }
-  }
-
-  previousHead = {
-    y: centerY,
-    time: now
-  };
-
-  return {
-    text:
-      `Head: ${yaw} · ` +
-      `Eyes: ${blink ? 'blink/closed' : 'open'} · ` +
-      `Mouth: ${mouthOpen ? 'open' : 'closed'}`,
-    motion
-  };
-}
-
-// -----------------------------
-// Drawing
-// -----------------------------
-
-function drawLandmarks(landmarks, color) {
-  if (!ctx || !canvas) return;
-
-  ctx.fillStyle = color;
-
-  for (const p of landmarks) {
-    const x =
-      (front ? 1 - p.x : p.x) *
-      canvas.width;
-
-    const y =
-      p.y * canvas.height;
-
-    ctx.beginPath();
-    ctx.arc(x, y, 1.4, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-
-// -----------------------------
-// Real-time processing
-// -----------------------------
-
-function loop() {
-  if (!running) return;
-
-  try {
-    if (
-      faceTask &&
-      handTask &&
-      video.readyState >= 2 &&
-      video.currentTime !== lastVideoTime
-    ) {
-      lastVideoTime = video.currentTime;
-
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-
-      const now = performance.now();
-
-      const faces =
-        faceTask.detectForVideo(video, now);
-
-      const hands =
-        handTask.detectForVideo(video, now);
-
-      ctx.clearRect(
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-
-      const fl =
-        faces.faceLandmarks || [];
-
-      const hl =
-        hands.landmarks || [];
-
-      lastFaceCount = fl.length;
-
-      lastFace =
-        fl.length === 1
-          ? template(fl[0])
-          : null;
-
-      fl.forEach(l =>
-        drawLandmarks(l, '#5df4bd')
-      );
-
-      hl.forEach(l =>
-        drawLandmarks(l, '#ffc970')
-      );
-
-      setText(
-        'faceInfo',
-        `Faces: ${fl.length}`
-      );
-
-      setText(
-        'handInfo',
-        `Hands: ${hl.length}` +
-        (
-          hl.length
-            ? ' · ' +
-              hl.map(gesture).join(' / ')
-            : ''
-        )
-      );
-
-      if (fl.length === 1) {
-        const info = faceAnalysis(
-          fl[0],
-          faces.faceBlendshapes?.[0]
-            ?.categories
-        );
-
-        setText(
-          'motionInfo',
-          info.text +
-          (
-            info.motion !== '—'
-              ? ' · ' + info.motion
-              : ''
-          )
-        );
-
-        const m =
-          closestProfile(lastFace);
-
-        if (m) {
-          setText(
-            'matchInfo',
-            `Closest saved geometry: ${m.name} ` +
-            `(distance ${m.distance.toFixed(3)}; ` +
-            'identity not verified)'
-          );
-        } else {
-          setText(
-            'matchInfo',
-            key
-              ? 'No saved profiles'
-              : 'Face library locked'
-          );
-        }
-
-      } else {
-        setText(
-          'motionInfo',
-          'Movement: —'
-        );
-
-        setText(
-          'matchInfo',
-          fl.length > 1
-            ? 'Matching paused: multiple faces'
-            : 'Saved face: —'
-        );
-
-        previousHead = null;
-      }
-
-      updateButtons();
-    }
-
-    if (lastError) {
-      lastError = '';
-    }
-
-  } catch (error) {
-    const message =
-      error?.message || String(error);
-
-    if (message !== lastError) {
-      lastError = message;
-      console.error(error);
-
-      status(
-        'Analysis error: ' + message
-      );
-    }
-  }
-
-  raf = requestAnimationFrame(loop);
-}
-
-// -----------------------------
-// IndexedDB storage
-// -----------------------------
-
-function openDb() {
-  return new Promise(
-    (resolve, reject) => {
-      const request = indexedDB.open(
-        'vision-ai-private-v1',
-        1
-      );
-
-      request.onupgradeneeded = () => {
-        const database = request.result;
-
-        if (
-          !database.objectStoreNames
-            .contains('data')
-        ) {
-          database.createObjectStore('data');
-        }
-      };
-
-      request.onsuccess = () =>
-        resolve(request.result);
-
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
-}
-
-function get(name) {
-  return new Promise(
-    (resolve, reject) => {
-      const request = db
-        .transaction('data')
-        .objectStore('data')
-        .get(name);
-
-      request.onsuccess = () =>
-        resolve(request.result);
-
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
-}
-
-function put(name, value) {
-  return new Promise(
-    (resolve, reject) => {
-      const request = db
-        .transaction(
-          'data',
-          'readwrite'
-        )
-        .objectStore('data')
-        .put(value, name);
-
-      request.onsuccess = () =>
-        resolve();
-
-      request.onerror = () =>
-        reject(request.error);
-    }
-  );
-}
-
-// -----------------------------
-// Encryption
-// -----------------------------
-
-function b64(value) {
-  return btoa(
-    String.fromCharCode(
-      ...new Uint8Array(value)
-    )
-  );
-}
-
-function bytes(value) {
-  return Uint8Array.from(
-    atob(value),
-    c => c.charCodeAt(0)
-  );
-}
-
-async function derive(pass, salt) {
-  const material =
-    await crypto.subtle.importKey(
-      'raw',
-      enc.encode(pass),
-      'PBKDF2',
-      false,
-      ['deriveKey']
-    );
-
-  return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt,
-      iterations: 250000,
-      hash: 'SHA-256'
-    },
-    material,
-    {
-      name: 'AES-GCM',
-      length: 256
-    },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function encryptData(data) {
-  const iv =
-    crypto.getRandomValues(
-      new Uint8Array(12)
-    );
-
-  const cipher =
-    await crypto.subtle.encrypt(
-      {
-        name: 'AES-GCM',
-        iv
-      },
-      key,
-      enc.encode(JSON.stringify(data))
-    );
-
-  return {
-    iv: b64(iv),
-    cipher: b64(cipher)
-  };
-}
-
-async function persist() {
-  if (!key || !db) {
-    throw new Error(
-      'Face library is locked.'
-    );
-  }
-
-  await put(
-    'vault',
-    await encryptData(profiles)
-  );
-
-  renderPeople();
-}
-
-// -----------------------------
-// Saved profile display
-// -----------------------------
-
-function renderPeople() {
-  const ul = $('people');
-  if (!ul) return;
-
-  ul.replaceChildren();
-
-  for (const p of profiles) {
-    const li =
-      document.createElement('li');
-
-    const name =
-      document.createElement('span');
-
-    const del =
-      document.createElement('button');
-
-    name.textContent = p.name;
-    del.textContent = 'Delete';
-
-    del.onclick = async () => {
-      if (
-        !confirm(
-          `Delete ${p.name}'s saved profile?`
-        )
-      ) {
-        return;
-      }
-
-      const previous = profiles;
-
-      try {
-        profiles = profiles.filter(
-          x => x.id !== p.id
-        );
-
-        await persist();
-
-        libraryStatus(
-          'Profile deleted'
-        );
-
-      } catch (error) {
-        profiles = previous;
-        renderPeople();
-
-        libraryStatus(
-          'Delete failed: ' + error.message
-        );
-      }
-    };
-
-    li.append(name, del);
-    ul.append(li);
-  }
-}
-
-// -----------------------------
-// Unlock encrypted library
-// -----------------------------
-
-async function unlock() {
-  try {
-    const pass = $('pass')?.value || '';
-
-    if (pass.length < 10) {
-      throw new Error(
-        'Use a passphrase of at least 10 characters.'
-      );
-    }
-
-    db ??= await openDb();
-
-    const storedSalt =
-      await get('salt');
-
-    const existing = !!storedSalt;
-
-    const proposedSalt = existing
-      ? bytes(storedSalt)
-      : crypto.getRandomValues(
-          new Uint8Array(16)
-        );
-
-    const proposedKey =
-      await derive(
-        pass,
-        proposedSalt
-      );
-
-    const vault =
-      await get('vault');
-
-    let data = [];
-
-    if (vault) {
-      const plaintext =
-        await crypto.subtle.decrypt(
-          {
-            name: 'AES-GCM',
-            iv: bytes(vault.iv)
-          },
-          proposedKey,
-          bytes(vault.cipher)
-        );
-
-      data = JSON.parse(
-        dec.decode(plaintext)
-      );
-
-      if (!Array.isArray(data)) {
-        throw new Error(
-          'Invalid library format.'
-        );
-      }
-
-    } else if (existing) {
-      throw new Error(
-        'Library data is missing.'
-      );
-    }
-
-    key = proposedKey;
-    profiles = data;
-
-    if (!existing) {
-      // Save encrypted empty vault first,
-      // then store its salt.
-      await persist();
-      await put(
-        'salt',
-        b64(proposedSalt)
-      );
-    }
-
-    $('pass').value = '';
-
-    renderPeople();
-    updateButtons();
-
-    libraryStatus(
-      `Library unlocked · ` +
-      `${profiles.length} saved profiles`
-    );
-
-  } catch (error) {
-    key = null;
-    profiles = [];
-
-    renderPeople();
-    updateButtons();
-
-    libraryStatus(
-      'Could not unlock: ' +
-      error.message
-    );
-  }
-}
-
-// -----------------------------
-// Lock library
-// -----------------------------
-
-function lock() {
-  key = null;
+  encryptionKey = null;
   profiles = [];
+});
 
-  renderPeople();
-  updateButtons();
-
-  libraryStatus('Library locked');
-}
-
-// -----------------------------
-// Save a consenting person's
-// experimental geometry profile
-// -----------------------------
-
-async function saveFace() {
-  try {
-    if (
-      !key ||
-      !lastFace ||
-      lastFaceCount !== 1
-    ) {
-      throw new Error(
-        'Unlock the library and show exactly one face.'
-      );
-    }
-
-    if (!$('consent')?.checked) {
-      throw new Error(
-        'Consent confirmation required.'
-      );
-    }
-
-    const name =
-      $('person')?.value.trim() || '';
-
-    if (
-      !name ||
-      name.length > 80
-    ) {
-      throw new Error(
-        'Enter a name of 1–80 characters.'
-      );
-    }
-
-    const profile = {
-      id: crypto.randomUUID(),
-      name,
-      template: [...lastFace],
-      createdAt:
-        new Date().toISOString()
-    };
-
-    profiles.push(profile);
-
-    try {
-      await persist();
-    } catch (error) {
-      profiles = profiles.filter(
-        p => p.id !== profile.id
-      );
-
-      throw error;
-    }
-
-    $('person').value = '';
-    $('consent').checked = false;
-
-    libraryStatus(
-      `${name} saved locally ` +
-      '(experimental face geometry)'
-    );
-
-  } catch (error) {
-    libraryStatus(error.message);
-  }
-}
-
-// -----------------------------
-// Connect buttons immediately
-// -----------------------------
-
-function initializeApp() {
-  const required = [
-    'video',
-    'overlay',
-    'start',
-    'stop',
-    'switch',
-    'unlock',
-    'lock',
-    'save',
-    'pass',
-    'person',
-    'consent',
-    'people'
-  ];
-
-  const missing =
-    required.filter(id => !$(id));
-
-  if (missing.length) {
-    const message =
-      'Missing HTML elements: ' +
-      missing.join(', ');
-
-    console.error(message);
-    status(message);
-    return;
-  }
-
-  $('start').addEventListener(
-    'click',
-    start
-  );
-
-  $('stop').addEventListener(
-    'click',
-    stop
-  );
-
-  $('switch').addEventListener(
-    'click',
-    switchCamera
-  );
-
-  $('unlock').addEventListener(
-    'click',
-    unlock
-  );
-
-  $('lock').addEventListener(
-    'click',
-    lock
-  );
-
-  $('save').addEventListener(
-    'click',
-    saveFace
-  );
-
-  updateButtons();
-
-  status('Idle — ready to start');
-  libraryStatus('Library locked');
-}
-
-window.addEventListener(
-  'pagehide',
-  () => {
-    running = false;
-    cleanupCamera();
-
-    key = null;
-    profiles = [];
-  }
-);
+// =====================================
+// START APP
+// =====================================
 
 if (document.readyState === 'loading') {
   document.addEventListener(
     'DOMContentLoaded',
-    initializeApp
+    initializeApp,
+    { once: true }
   );
 } else {
   initializeApp();
